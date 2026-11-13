@@ -17,7 +17,8 @@ one's branch chain, upstream first, e.g. prod,stage,dev. For each adjacent
 pair it lists the commits the upstream branch has and the downstream branch
 is missing, compared by patch content so a cherry-picked copy counts as
 present, and the submodules whose recorded commit differs between the two.
-It only reads: nothing is fetched without --fetch, and nothing is written.
+It only reads: nothing is fetched without --fetch, and nothing is written
+except driftr.chain by driftr config --set.
 
 A repository's chain is the first of:
   1. --chain LIST
