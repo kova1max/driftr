@@ -1,0 +1,41 @@
+{
+  "name": "@kova1/driftr",
+  "version": "0.1.0",
+  "description": "Find commits that are on prod but missing from stage or dev, in every git repository under a directory",
+  "keywords": [
+    "git",
+    "branches",
+    "drift",
+    "cherry-pick",
+    "cli",
+    "workspace"
+  ],
+  "homepage": "https://github.com/kova1max/driftr#readme",
+  "bugs": "https://github.com/kova1max/driftr/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kova1max/driftr.git"
+  },
+  "license": "MIT",
+  "author": "Max Koval <kova1max99@gmail.com>",
+  "bin": {
+    "driftr": "bin/driftr"
+  },
+  "files": [
+    "bin/driftr"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "scripts": {
+    "lint": "shellcheck bin/driftr",
+    "test": "bats test"
+  },
+  "devDependencies": {
+    "bats": "^1.13.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# For every git repository under a directory, list the commits each branch in
+# a chain (prod,stage,dev) has that the next branch down is missing.
+# Usage: driftr [options] [DIR]  |  driftr config [options] [DIR]
+set -euo pipefail
+
+VERSION="0.1.0" # set by the release workflow
+
+usage() {
+  cat <<'EOF'
+Usage: driftr [options] [DIR]
+       driftr config [--chain LIST] [--remote NAME] [--max-depth N] [DIR]
+       driftr config --set LIST [--global | --repo] [DIR]
+
+Finds git repositories under DIR (default: current directory) and walks each
+one's branch chain, upstream first, e.g. prod,stage,dev. For each adjacent
+pair it lists the commits the upstream branch has and the downstream branch
+is missing, compared by patch content so a cherry-picked copy counts as
+present, and the submodules whose recorded commit differs between the two.
+It only reads: nothing is fetched without --fetch, and nothing is written
+except driftr.chain by driftr config --set.
+
+A repository's chain is the first of:
+  1. --chain LIST
+  2. git config driftr.chain (the repository's, your global config, or a
+     config included with includeIf for a whole directory)
+  3. git config task.env.prod, task.env.stage and task.env.dev, all set
+Repositories with none are reported as having no chain configured.
+
+Options:
+      --chain LIST   Comma-separated branches, upstream first: prod,stage,dev.
+                     A bare name is a branch on the remote (see --remote);
+                     remote/name picks a branch on another remote.
+      --remote NAME  Remote for bare branch names (default: origin).
+      --max-depth N  How many directory levels below DIR to search (default: 2).
+                     0 = only DIR itself, 1 = DIR and its direct children, ...
+      --fetch        Fetch the remotes of each repository first, 8 at a time.
+                     git never prompts for credentials.
+      --md           Print a Markdown table instead, for pasting elsewhere.
+  -q, --quiet        Only show pairs that drifted and repositories that failed.
+      --no-color     Disable colored output. Also disabled when NO_COLOR is
+                     set (https://no-color.org) or output is not a terminal.
+  -V, --version      Print the version.
+  -h, --help         Show this help.
+
+driftr config shows each repository's chain and where it comes from.
+  --set LIST         Write LIST to driftr.chain with git config, in the
+                     repository at DIR (--repo, the default) or in your global
+                     config (--global). Nothing else is written.
+
+Exit status: 0 no drift, 1 drift found or a fetch failed, 2 invalid arguments.
+EOF
+}
+
+cmd=check
+if [[ "${1:-}" == config ]]; then
+  cmd=config
+  shift
+fi
+
+chain_flag=0
+flag_chain=""
+remote=origin
+max_depth=2
+fetch=0
+md=0
+quiet=0
+color=1
+set_chain=""
+set_scope=""
+root=""
+
+while (($#)); do
+  case "$1" in
+    --chain) flag_chain="${2:-}"; chain_flag=1; shift 2 || { usage >&2; exit 2; } ;;
+    --chain=*) flag_chain="${1#*=}"; chain_flag=1; shift ;;
+    --remote) remote="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --remote=*) remote="${1#*=}"; shift ;;
+    --max-depth) max_depth="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --max-depth=*) max_depth="${1#*=}"; shift ;;
+    --fetch) fetch=1; shift ;;
+    --md) md=1; shift ;;
+    -q|--quiet) quiet=1; shift ;;
+    --no-color) color=0; shift ;;
+    --set) set_chain="${2:-}"; shift 2 || { usage >&2; exit 2; } ;;
+    --set=*) set_chain="${1#*=}"; shift ;;
+    --global) set_scope=global; shift ;;
+    --repo) set_scope=repo; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "driftr $VERSION"; exit 0 ;;
+    -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)
+      [[ -z "$root" ]] || { echo "Only one DIR allowed" >&2; exit 2; }
+      root="$1"; shift ;;
+  esac
+done
+
+die() {
+  echo "$1" >&2
+  exit 2
+}
+
+# Splits a comma-separated chain into the global array `branches`, trimming
+# spaces around each name. Fails unless there are 2 or more non-empty names.
+split_chain() {
+  local rest="$1," part
+  branches=()
+  while [[ -n "$rest" ]]; do
+    part="${rest%%,*}"
+    rest="${rest#*,}"
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ -n "$part" ]] || return 1
+    branches+=("$part")
+  done
+  ((${#branches[@]} >= 2))
+}
+
+chain_hint="needs 2 or more comma-separated branches, upstream first, e.g. prod,stage,dev"
+
+[[ "$max_depth" =~ ^[0-9]+$ ]] || die "--max-depth must be a non-negative integer"
+[[ -n "$remote" ]] || die "--remote must not be empty"
+if ((chain_flag)); then
+  split_chain "$flag_chain" || die "Invalid --chain '$flag_chain': $chain_hint"
+fi
+if [[ "$cmd" == check ]]; then
+  [[ -z "$set_chain$set_scope" ]] || die "--set, --global and --repo only work with driftr config"
+else
+  ((fetch + md + quiet == 0)) || die "--fetch, --md and --quiet do not work with driftr config"
+  [[ -z "$set_scope" || -n "$set_chain" ]] || die "--global and --repo need --set LIST"
+  [[ -z "$set_chain" ]] || ((!chain_flag)) || die "--set and --chain cannot be combined"
+  [[ "$set_scope" != global || -z "$root" ]] || die "--set with --global takes no DIR"
+fi
+root="${root:-.}"
+[[ -d "$root" ]] || die "Not a directory: $root"
+root="$(cd "$root" && pwd)"
+
+# --- driftr config --set -----------------------------------------------------
+
+if [[ -n "$set_chain" ]]; then
+  split_chain "$set_chain" || die "Invalid chain '$set_chain': $chain_hint"
+  value="$(IFS=,; printf '%s' "${branches[*]}")"
+  if [[ "$set_scope" == global ]]; then
+    git config --global driftr.chain "$value"
+    echo "driftr.chain = $value (global config)"
+  else
+    top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" ||
+      die "Not a git repository: $root (pass a repository, or use --global)"
+    git -C "$top" config --local driftr.chain "$value"
+    echo "driftr.chain = $value (repository $top)"
+  fi
+  exit 0
+fi
+
+# https://no-color.org: any non-empty NO_COLOR disables color
+if [[ "$color" == 1 && "$md" == 0 && -z "${NO_COLOR:-}" && -t 1 ]]; then
+  yellow=$'\e[33m' red=$'\e[31m' dim=$'\e[2m' reset=$'\e[0m'
+else
+  yellow="" red="" dim="" reset=""
+fi
+
+# --- discovery ---------------------------------------------------------------
+
+repos=()
+walk() {
+  local dir="$1" depth="$2"
+  if [[ -e "$dir/.git" ]]; then
+    repos+=("$dir")
+    return
+  fi
+  ((depth < max_depth)) || return 0
+  local child
+  for child in "$dir"/*/; do
+    [[ -d "$child" && ! -L "${child%/}" ]] || continue
+    walk "${child%/}" $((depth + 1))
+  done
+}
+
+walk "$root" 0
+
+count=${#repos[@]}
+if ((count == 0)); then
+  echo "No git repositories found under $root (max depth $max_depth)"
+  exit 0
+fi
+
+repo_label() {
+  local rel="${1#"$root"}"
+  rel="${rel#/}"
+  printf '%s' "${rel:-.}"
+}
+
+# --- chain resolution --------------------------------------------------------
+
+# Sets chain_value and chain_source for the repository in $1, or fails when
+# no chain is configured for it.
+resolve_chain() {
+  local repo="$1" line rest prod stage dev
+  if ((chain_flag)); then
+    chain_value="$flag_chain" chain_source="--chain"
+    return 0
+  fi
+  # "<scope>\t<origin>\t<value>", from whichever config file git reads last
+  if line="$(git -C "$repo" config --show-scope --show-origin --get driftr.chain)"; then
+    rest="${line#*$'\t'}"
+    chain_value="${rest#*$'\t'}"
+    rest="${rest%%$'\t'*}"
+    chain_source="driftr.chain, ${line%%$'\t'*} config ${rest#file:}"
+    return 0
+  fi
+  if prod="$(git -C "$repo" config --get task.env.prod)" && [[ -n "$prod" ]] &&
+    stage="$(git -C "$repo" config --get task.env.stage)" && [[ -n "$stage" ]] &&
+    dev="$(git -C "$repo" config --get task.env.dev)" && [[ -n "$dev" ]]; then
+    chain_value="$prod,$stage,$dev" chain_source="task.env.prod, task.env.stage, task.env.dev"
+    return 0
+  fi
+  return 1
+}
+
+# The remote-tracking name for a chain entry: "remote/branch" stays as it is
+# when "remote" is one of the repository's remotes ($1, one per line),
+# anything else is a branch on --remote.
+tracking_name() {
+  local first="${2%%/*}"
+  if [[ "$2" == */* ]] && printf '%s\n' "$1" | grep -qxF -- "$first"; then
+    printf '%s' "$2"
+  else
+    printf '%s/%s' "$remote" "$2"
+  fi
+}
+
+no_chain_note="no chain configured: set driftr.chain, e.g. driftr config --set prod,stage,dev"
+
+# --- driftr config -----------------------------------------------------------
+
+if [[ "$cmd" == config ]]; then
+  labels=() chains=() sources=()
+  width=0
+  for ((i = 0; i < count; i++)); do
+    label="$(repo_label "${repos[i]}")"
+    ((${#label} <= width)) || width=${#label}
+    labels+=("$label")
+    if ! resolve_chain "${repos[i]}"; then
+      chains+=("$no_chain_note") sources+=("")
+    elif ! split_chain "$chain_value"; then
+      chains+=("invalid chain '$chain_value': $chain_hint") sources+=("$chain_source")
+    else
+      remotes="$(git -C "${repos[i]}" remote)"
+      shown=""
+      for b in "${branches[@]}"; do
+        shown+="${shown:+ -> }$(tracking_name "$remotes" "$b")"
+      done
+      chains+=("$shown") sources+=("$chain_source")
+    fi
+  done
+  for ((i = 0; i < count; i++)); do
+    printf '%-*s  %s%s\n' "$width" "${labels[i]}" "${chains[i]}" \
+      "${sources[i]:+  $dim(${sources[i]})$reset}"
+  done
+  exit 0
+fi
+
+# --- fetch -------------------------------------------------------------------
+
+# Per repository: its chain (normalised), or empty when it has none, and why.
+repo_chain=() repo_note=() repo_remotes=()
+for ((i = 0; i < count; i++)); do
+  if ! resolve_chain "${repos[i]}"; then
+    repo_chain+=("") repo_note+=("$no_chain_note") repo_remotes+=("")
+  elif ! split_chain "$chain_value"; then
+    repo_chain+=("") repo_note+=("invalid chain '$chain_value' ($chain_source): $chain_hint") repo_remotes+=("")
+  else
+    remotes="$(git -C "${repos[i]}" remote)" needed=""
+    for b in "${branches[@]}"; do
+      name="$(tracking_name "$remotes" "$b")"
+      [[ " $needed " == *" ${name%%/*} "* ]] || needed+="${needed:+ }${name%%/*}"
+    done
+    repo_chain+=("$(IFS=,; printf '%s' "${branches[*]}")") repo_note+=("") repo_remotes+=("$needed")
+  fi
+done
+
+scratch=""
+if ((fetch)); then
+  scratch="$(mktemp -d)"
+  trap 'rm -rf "$scratch"' EXIT
+  export GIT_TERMINAL_PROMPT=0
+  # A failed fetch leaves its error in $scratch/<index>.
+  # shellcheck disable=SC2016  # the single-quoted body runs inside the child shell
+  for ((i = 0; i < count; i++)); do
+    [[ -z "${repo_remotes[i]}" ]] || printf '%s\0%s\0%s\0' "$i" "${repos[i]}" "${repo_remotes[i]}"
+  done | xargs -0 -n 3 -P 8 "$BASH" -c '
+    [[ -n "${3:-}" ]] || exit 0
+    for r in $4; do
+      out="$(git -C "$3" fetch --quiet "$r" </dev/null 2>&1)" || { printf "%s\n" "$out" >"$1/$2"; exit 0; }
+    done' _ "$scratch"
+fi
+
+# --- comparison --------------------------------------------------------------
+# One row per pair (or per problem). kind: sync, drift, skip or fail. For a
+# pair, commits holds "sha<TAB>subject" lines and subs holds
+# "path<TAB>upstream sha<TAB>downstream sha" lines.
+
+row_repo=() row_kind=() row_up=() row_down=() row_note=() row_count=() row_commits=() row_subs=()
+add_row() {
+  row_repo+=("$1") row_kind+=("$2") row_up+=("$3") row_down+=("$4") row_note+=("$5")
+  row_count+=("$6") row_commits+=("$7") row_subs+=("$8")
+}
+
+plural() {
+  printf '%s %s%s' "$1" "$2" "$([[ "$1" == 1 ]] || printf s)"
+}
+
+# Submodules whose recorded commit differs between two commits ($2 upstream,
+# $3 downstream), absent on one side included.
+submodule_diff() {
+  local meta path omode nmode osha nsha
+  git -C "$1" diff-tree -r --no-renames "$3" "$2" | while IFS=$'\t' read -r meta path; do
+    read -r omode nmode osha nsha _ <<<"$meta"
+    [[ "$omode" == :160000 || "$nmode" == 160000 ]] || continue
+    [[ "$nmode" == 160000 ]] || nsha=""
+    [[ "$omode" == :160000 ]] || osha=""
+    printf '%s\t%s\t%s\n' "$path" "${nsha:0:7}" "${osha:0:7}"
+  done
+}
+
+drifted=0 insync=0 skipped=0 failed=0
+drifted_repos=() failed_repos=()
+
+for ((i = 0; i < count; i++)); do
+  repo="${repos[i]}"
+  label="$(repo_label "$repo")"
+  if [[ -z "${repo_chain[i]}" ]]; then
+    add_row "$label" skip "" "" "${repo_note[i]}" "" "" ""
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if [[ -n "$scratch" && -e "$scratch/$i" ]]; then
+    add_row "$label" fail "" "" "fetch failed:"$'\n'"$(cat "$scratch/$i")" "" "" ""
+    failed=$((failed + 1)) failed_repos+=("$label")
+    continue
+  fi
+
+  split_chain "${repo_chain[i]}"
+  remotes="$(git -C "$repo" remote)"
+  refs=()
+  missing_names=""
+  for b in "${branches[@]}"; do
+    name="$(tracking_name "$remotes" "$b")"
+    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/$name^{commit}" >/dev/null; then
+      refs+=("refs/remotes/$name")
+    else
+      refs+=("")
+      # a chain may name a branch twice; report it once
+      [[ " $missing_names " == *" $name "* ]] ||
+        add_row "$label" skip "" "" "$name not found; skipping its pairs" "" "" ""
+      missing_names+=" $name"
+    fi
+  done
+
+  repo_drift=0
+  for ((p = 0; p + 1 < ${#branches[@]}; p++)); do
+    up="${refs[p]}" down="${refs[p + 1]}"
+    [[ -n "$up" && -n "$down" ]] || continue
+    commits="$(git -C "$repo" log --no-merges --right-only --cherry-pick --format='%h%x09%s' "$down...$up")"
+    subs="$(submodule_diff "$repo" "$up" "$down")"
+    n=0 s=0
+    [[ -z "$commits" ]] || n="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
+    [[ -z "$subs" ]] || s="$(printf '%s\n' "$subs" | wc -l | tr -d ' ')"
+    if ((n + s == 0)); then
+      add_row "$label" sync "${branches[p]}" "${branches[p + 1]}" "in sync" 0 "" ""
+    else
+      note=""
+      ((n == 0)) || note="$(plural "$n" commit) missing"
+      ((s == 0)) || note+="${note:+, }$(plural "$s" submodule) differ$([[ "$s" != 1 ]] || printf s)"
+      add_row "$label" drift "${branches[p]}" "${branches[p + 1]}" "$note" "$n" "$commits" "$subs"
+      repo_drift=1
+    fi
+  done
+
+  if ((repo_drift)); then
+    drifted=$((drifted + 1)) drifted_repos+=("$label")
+  elif [[ -n "$missing_names" ]]; then
+    skipped=$((skipped + 1))
+  else
+    insync=$((insync + 1))
+  fi
+done
+
+# --- output ------------------------------------------------------------------
+
+shown() {
+  ((!quiet)) || [[ "${row_kind[$1]}" == drift || "${row_kind[$1]}" == fail ]]
+}
+
+rows=${#row_repo[@]}
+
+if ((md)); then
+  cell() {
+    local text="${1//|/\\|}"
+    printf '%s' "${text//$'\n'/<br>}"
+  }
+  echo "| Repo | Pair | Missing | Details |"
+  echo "| :--- | :--- | ---: | :--- |"
+  for ((r = 0; r < rows; r++)); do
+    shown "$r" || continue
+    pair="" details=""
+    [[ -z "${row_up[r]}" ]] || pair="${row_up[r]} → ${row_down[r]}"
+    case "${row_kind[r]}" in
+      sync) details="" ;;
+      drift)
+        while IFS=$'\t' read -r sha subject; do
+          [[ -z "$sha" ]] || details+="${details:+<br>}\`$sha\` $(cell "$subject")"
+        done <<<"${row_commits[r]}"
+        while IFS=$'\t' read -r path upsha downsha; do
+          [[ -z "$path" ]] || details+="${details:+<br>}submodule \`$(cell "$path")\`: \`${upsha:-none}\` on $(cell "${row_up[r]}"), \`${downsha:-none}\` on $(cell "${row_down[r]}")"
+        done <<<"${row_subs[r]}"
+        ;;
+      *) details="$(cell "${row_note[r]}")" ;;
+    esac
+    printf '| %s | %s | %s | %s |\n' "$(cell "${row_repo[r]}")" "$(cell "$pair")" "${row_count[r]:--}" "$details"
+  done
+  echo
+else
+  repo_width=0 pair_width=0 printed=0
+  for ((r = 0; r < rows; r++)); do
+    shown "$r" || continue
+    printed=$((printed + 1))
+    ((${#row_repo[r]} <= repo_width)) || repo_width=${#row_repo[r]}
+    pair="${row_up[r]} -> ${row_down[r]}"
+    [[ -z "${row_up[r]}" || ${#pair} -le $pair_width ]] || pair_width=${#pair}
+  done
+  for ((r = 0; r < rows; r++)); do
+    shown "$r" || continue
+    case "${row_kind[r]}" in
+      sync) mark="$dim=$reset" ;;
+      drift) mark="$red!$reset" ;;
+      skip) mark="$yellow-$reset" ;;
+      fail) mark="${red}x$reset" ;;
+    esac
+    if [[ -n "${row_up[r]}" ]]; then
+      printf '%s %-*s  %-*s  %s\n' "$mark" "$repo_width" "${row_repo[r]}" \
+        "$pair_width" "${row_up[r]} -> ${row_down[r]}" "${row_note[r]}"
+    else
+      note="${row_note[r]}"
+      printf '%s %-*s  %s\n' "$mark" "$repo_width" "${row_repo[r]}" "${note%%$'\n'*}"
+      [[ "$note" != *$'\n'* ]] || printf '%s\n' "${note#*$'\n'}" | sed 's/^/    /'
+    fi
+    if [[ "${row_kind[r]}" == drift ]]; then
+      while IFS=$'\t' read -r sha subject; do
+        [[ -z "$sha" ]] || printf '    %s%s%s %s\n' "$dim" "$sha" "$reset" "$subject"
+      done <<<"${row_commits[r]}"
+      while IFS=$'\t' read -r path upsha downsha; do
+        [[ -z "$path" ]] || printf '    submodule %s: %s on %s, %s on %s\n' \
+          "$path" "${upsha:-none}" "${row_up[r]}" "${downsha:-none}" "${row_down[r]}"
+      done <<<"${row_subs[r]}"
+    fi
+  done
+  ((printed == 0)) || echo
+fi
+
+printf 'Repos: %d  in sync: %d  %sdrifted: %d%s  %sskipped: %d%s  %sfailed: %d%s\n' \
+  "$count" "$insync" "$red" "$drifted" "$reset" "$yellow" "$skipped" "$reset" "$red" "$failed" "$reset"
+((drifted == 0)) || printf 'Drifted: %s\n' "${drifted_repos[*]}"
+((failed == 0)) || printf 'Failed: %s\n' "${failed_repos[*]}"
+((drifted + failed == 0)) || exit 1

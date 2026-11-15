@@ -1,0 +1,177 @@
+name: Release
+
+# Run by hand: Actions tab -> Release -> Run workflow, or
+#   gh workflow run release.yml -f bump=minor -f notes="Highlights ..."
+# It bumps the version, commits and tags it on master as github-actions[bot],
+# creates the GitHub release, then publishes to npm, GitHub Packages and the
+# Homebrew tap, and installs from the tap to verify. Everything runs in this
+# one workflow because pushes and tags made with GITHUB_TOKEN trigger no other
+# workflow.
+#
+# Each publishing job runs in a GitHub environment (npm, github-packages,
+# homebrew), so every release shows up under the repo's Deployments with a
+# link to what it published. The environments only accept the master branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      notes:
+        description: Summary shown above the generated list of pull requests (Markdown, optional)
+        type: string
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false # never cache in release builds
+      - run: npm ci
+      - id: bump
+        name: Bump the version in package.json and bin/driftr
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          version="$(npm version "$BUMP" --no-git-tag-version)"
+          version="${version#v}"
+          sed -i -E "s/^VERSION=\"[^\"]*\"/VERSION=\"$version\"/" bin/driftr
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "tag=v$version" >>"$GITHUB_OUTPUT"
+      - run: shellcheck bin/driftr
+      - run: npm test
+      - name: Commit, tag and push
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "release $TAG"
+          git tag -a "$TAG" -m "$TAG"
+          git push --atomic origin HEAD:master "$TAG"
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+        # --notes goes above the generated notes; empty keeps just the generated part
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --notes "$NOTES" --generate-notes
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    # npm's trusted publisher must name this environment: the OIDC token
+    # carries it, and npm checks it.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@kova1/driftr/v/${{ needs.release.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false # never cache in release builds
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing: npm accepts this job's OIDC token because the
+      # package trusts kova1max/driftr + release.yml (set up with `npm trust`).
+      - run: npm publish
+      # No install check here: npm takes anywhere from minutes to over ten to
+      # serve a new version, so waiting on it made releases fail after a
+      # successful publish. npm publish exiting 0 is the confirmation.
+
+  github-packages:
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-packages
+      url: https://github.com/kova1max/driftr/pkgs/npm/driftr
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false # never cache in release builds
+          registry-url: https://npm.pkg.github.com
+          scope: "@kova1max"
+      # GitHub Packages only accepts packages scoped to the repo owner, so the
+      # mirror is published as @kova1max/driftr while npmjs.org keeps @kova1/driftr.
+      # The tarball contents are otherwise identical.
+      - run: npm pkg set name=@kova1max/driftr
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+      - name: Verify the mirrored package is visible
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: test "$(npm view "@kova1max/driftr@$VERSION" version)" = "$VERSION"
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: homebrew
+      url: https://github.com/kova1max/homebrew-tap/blob/main/Formula/driftr.rb
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: kova1max/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+      - name: Point the formula at the new tag
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          url="https://github.com/kova1max/driftr/archive/refs/tags/$TAG.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          sed -i -E \
+            -e "s|^  url \".*\"|  url \"$url\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
+            Formula/driftr.rb
+          git diff --exit-code --quiet && { echo "Formula already at $TAG"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "driftr ${TAG#v}"
+          git push
+
+  verify-homebrew:
+    needs: [release, homebrew]
+    runs-on: macos-latest
+    permissions: {}
+    steps:
+      - name: Install from the tap and run the formula test
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          brew install kova1max/tap/driftr
+          brew test kova1max/tap/driftr
+          test "$(driftr --version)" = "driftr $VERSION"
